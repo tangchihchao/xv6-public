@@ -3,7 +3,7 @@
 #include "types.h"
 #include "user.h"
 #include "fcntl.h"
-
+#include "fs.h"
 // Parsed command representation
 #define EXEC  1
 #define REDIR 2
@@ -63,7 +63,7 @@ runcmd(struct cmd *cmd)
   struct listcmd *lcmd;
   struct pipecmd *pcmd;
   struct redircmd *rcmd;
-
+  int r;
   if(cmd == 0)
     exit();
 
@@ -75,8 +75,11 @@ runcmd(struct cmd *cmd)
     ecmd = (struct execcmd*)cmd;
     if(ecmd->argv[0] == 0)
       exit();
-    exec(ecmd->argv[0], ecmd->argv);
+    r=exec(ecmd->argv[0], ecmd->argv);
     printf(2, "exec %s failed\n", ecmd->argv[0]);
+    if(r==E_CORRUPTED)
+      printf(2, ": %s is corrupted", ecmd->argv[0]);
+    printf(2, "\n");	
     break;
 
   case REDIR:
@@ -146,9 +149,10 @@ main(void)
 {
   static char buf[100];
   int fd;
-
-  // Ensure that three file descriptors are open.
+        printf(2,"yes");
+  // Assumes that three file descriptors open.
   while((fd = open("console", O_RDWR)) >= 0){
+
     if(fd >= 3){
       close(fd);
       break;
@@ -157,6 +161,7 @@ main(void)
 
   // Read and run input commands.
   while(getcmd(buf, sizeof(buf)) >= 0){
+
     if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
       // Chdir must be called by the parent, not the child.
       buf[strlen(buf)-1] = 0;  // chop \n

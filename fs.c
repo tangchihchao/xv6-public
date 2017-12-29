@@ -186,7 +186,7 @@ iinit(int dev)
           sb.bmapstart);
 }
 
-static struct inode* iget(uint dev, uint inum);
+struct inode* iget(uint dev, uint inum);
 
 //PAGEBREAK!
 // Allocate an inode on device dev.
@@ -214,6 +214,47 @@ ialloc(uint dev, short type)
   panic("ialloc: no inodes");
 }
 
+//Compute inode checksum
+uint ichecksum(struct inode *ip)
+{
+
+  // We do not want to checksum files like console
+  if (ip->type == T_DEV) // 註1
+    return 0;
+
+  unsigned int buf[512];
+  char *cbuf = (char *)buf; // sets cbuf to point to buf's pointee
+  uint n = sizeof(buf);
+  uint off = 0;
+  uint r, i;
+  unsigned int checksum = 0;
+  memset((void *)cbuf, 0, n); // 將cbuf全部值設為0
+  unsigned int *bp;
+
+  // readi不停將inode *ip值寫入cbuf中(一次大小為n)
+  // for迴圈一次跑完 [sizeof(buf) / sizeof(uint)] == n
+  //     一一取出buf中的值，一一讓checksum ^= *bp (XOR運算)
+  //     bp指針隨for迴圈持續前進，直到迴圈跳出
+  while ((r = readi(ip, cbuf, off, n)) > 0)
+  {                           // 將ip中的資料依序讀入cbuf中(註2)
+    off += r;                 // r == n
+    bp = (unsigned int *)buf; // sets bp to point to buf's pointee
+
+    // 讀取存在buf中的每個unsigned int
+    for (i = 0; i < sizeof(buf) / sizeof(uint); i++)
+    {
+
+      // buf == char* cbuf
+      // *bp == (unsigned int *)buf
+      checksum ^= *bp;
+      bp++;
+    }
+    memset((void *)cbuf, 0, n); // 將cbuf全部值重設為0
+  }
+
+  return checksum;
+}
+
 // Copy a modified in-memory inode to disk.
 // Must be called after every change to an ip->xxx field
 // that lives on disk, since i-node cache is write-through.
@@ -221,25 +262,76 @@ ialloc(uint dev, short type)
 void
 iupdate(struct inode *ip)
 {
+  iupdate_ext(ip, 0);
+}
+
+// Update a child-inode
+void cupdate(struct inode *ip, struct inode *ic)
+{
+  ilock_ext(ic, 0);
+
+  if (ic->type != T_DITTO)
+    panic("trying to update a \"child\" that is not a ditto block!\n");
+
+  struct buf *bp;
+  struct dinode *dic;
+
+  bp = bread(ip->dev, IBLOCK(ip->inum, sb));
+  dic = (struct dinode *)bp->data + ic->inum % IPB;
+  dic->type = ic->type;
+  dic->major = ic->major;
+  dic->minor = ic->minor;
+  dic->nlink = 1;
+  ic->size = ip->size; // 直接沿用 parent size
+  dic->size = ic->size;
+  dic->child1 = ic->child1;
+  dic->child2 = ic->child2;
+  ic->checksum = ip->checksum; // 直接沿用 parent checksum
+  dic->checksum = ic->checksum;
+  memmove(dic->addrs, ic->addrs, sizeof(ic->addrs));
+  log_write(bp);
+  brelse(bp);
+
+  iunlock(ic);
+}
+
+void iupdate_ext(struct inode *ip, uint skip)
+{
   struct buf *bp;
   struct dinode *dip;
 
   bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-  dip = (struct dinode*)bp->data + ip->inum%IPB;
+  dip = (struct dinode *)bp->data + ip->inum % IPB;
   dip->type = ip->type;
   dip->major = ip->major;
   dip->minor = ip->minor;
   dip->nlink = ip->nlink;
   dip->size = ip->size;
+
+  dip->child1 = ip->child1;
+  dip->child2 = ip->child2;
+  ip->checksum = ichecksum(ip);
+  /* if (ip->checksum != dip->checksum)
+    cprintf("	[I] updating checksum of inode %d from %x to %x.\n", ip->inum, dip->checksum, ip->checksum); // */
+  
+  dip->checksum = ip->checksum;
   memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
   log_write(bp);
   brelse(bp);
-}
 
+  // Update children
+  if (skip == 0)
+  {
+    if (ip->child1)
+      cupdate(ip, iget(ip->dev, ip->child1));
+    if (ip->child2)
+      cupdate(ip, iget(ip->dev, ip->child2));
+  }
+}
 // Find the inode with number inum on device dev
 // and return the in-memory copy. Does not lock
 // the inode and does not read it from disk.
-static struct inode*
+struct inode*
 iget(uint dev, uint inum)
 {
   struct inode *ip, *empty;
@@ -285,31 +377,130 @@ idup(struct inode *ip)
 
 // Lock the given inode.
 // Reads the inode from disk if necessary.
-void
+int
 ilock(struct inode *ip)
+{
+  return ilock_ext(ip, 1);
+}
+
+// Reads the given inode, from disk if necessary,
+// Recovering its data in a transaction if necessary.
+// Guaranteed to return a locked inode OR panic, if the
+// file is recoverable.
+int ilock_trans(struct inode *ip)
+{
+  int r = ilock(ip);
+
+  struct inode *ic;
+
+  if (r == 0)
+    return 0;
+
+  if (r == E_CORRUPTED)
+    return E_CORRUPTED;
+
+  if (r > 0)
+  {
+    ic = iget(ip->dev, r);
+    irescue(ip, ic);
+  }
+
+  r = ilock(ip);
+
+  if (r == 0)
+    return 0;
+
+  panic("ilock_trans attempted to recover but still failed to unlock");
+}
+
+int ilock_ext(struct inode *ip, int checksum)
 {
   struct buf *bp;
   struct dinode *dip;
 
-  if(ip == 0 || ip->ref < 1)
+  if (ip == 0 || ip->ref < 1)
     panic("ilock");
 
   acquiresleep(&ip->lock);
 
-  if(ip->valid == 0){
+  if (ip->valid == 0)
+  {
     bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-    dip = (struct dinode*)bp->data + ip->inum%IPB;
+    dip = (struct dinode *)bp->data + ip->inum % IPB;
     ip->type = dip->type;
     ip->major = dip->major;
     ip->minor = dip->minor;
     ip->nlink = dip->nlink;
     ip->size = dip->size;
+
+    ip->child1 = dip->child1;
+    ip->child2 = dip->child2;
+    ip->checksum = dip->checksum;
+
     memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
     brelse(bp);
+
+    // Initialize some checking variables
+    uint replica = REPLICA_SELF;
+    ushort rinum;
+    struct inode *rinode;
+
+    if (checksum == 0)
+      goto zc_success;
+
+  zc_verify:
+    if (ichecksum(ip) == ip->checksum)
+    {
+      goto zc_success;
+    }
+    else
+    {
+      replica++;
+
+      // Does replica exist?
+      if (replica == REPLICA_CHILD_1)
+        rinum = ip->child1;
+      else if (replica == REPLICA_CHILD_2)
+        rinum = ip->child2;
+      else
+        goto zc_failure;
+
+      if (!rinum)
+        goto zc_failure;
+
+      // Obtain and grab a lock on rinode.
+      rinode = iget(ip->dev, rinum);
+
+      if (ilock(rinode) == 0)
+      {
+        iunlock(rinode);
+        iunlock(ip);
+        return rinum;
+      }
+
+      // Try to verify again...
+      goto zc_verify;
+    }
+  zc_failure:
+    /* cprintf("============================\n");
+        cprintf("The inum: %d \n", ip->inum);
+        cprintf("Inode Type: %d \n", ip->type);
+        cprintf("Checksum in inode: %x \n",ip->checksum);
+        cprintf("Computed checksum: %x \n", ichecksum(ip));
+        cprintf("============================\n"); */
+    iunlock(ip);
+    return E_CORRUPTED;
+
+  zc_success:
+    /*    cprintf("[inum %d] the checksums MATCHED\n    ip->c = %p  == c() = %p\n",
+      ip->inum, ip->checksum, ichecksum(ip)); // */
+
     ip->valid = 1;
-    if(ip->type == 0)
+    if (ip->type == 0)
       panic("ilock: no type");
   }
+
+  return 0;
 }
 
 // Unlock the given inode.
@@ -358,6 +549,58 @@ iunlockput(struct inode *ip)
 {
   iunlock(ip);
   iput(ip);
+}
+
+void irescue(struct inode *ip, struct inode *rinode)
+{
+
+  int max = ((LOGSIZE - 1 - 1 - 2) / 4) * 512;
+  int i = 0;
+  uint off = 0;
+
+  ilock_ext(rinode, 0);
+  ilock_ext(ip, 0);
+
+  int n = ip->size;
+
+  while (i < n)
+  {
+    int n1 = n - i;
+    if (n1 > max)
+      n1 = max;
+
+    begin_op();
+    // cprintf("[%d] irescue: Calling iduplicate on %d with off = %d, n = %d.\n", rinode->inum, ip->inum, off, n1);
+    iduplicate(rinode, ip, off, n1);
+    end_op();
+
+    off += n1;
+    i += n1;
+  }
+
+  iunlock(rinode);
+  iunlock(ip);
+}
+
+void iduplicate(struct inode *src, struct inode *dst, uint off, uint ntotal)
+{
+  char buf[512];
+
+  uint n = sizeof(buf);
+  memset((void *)buf, 0, n);
+  uint r;
+  uint _off = off;
+
+  dst->checksum = src->checksum;
+  dst->size = src->size;
+
+  while (((r = readi(src, buf, off, n)) > 0) && (off < (ntotal + _off)))
+  {
+    // cprintf("[%d] iduplicate: Calling writei on %d with off = %d, n = %d.\n", src->inum, dst->inum, off, n); // */
+    writei_ext(dst, buf, off, r, 1);
+    off += r;
+    memset((void *)buf, 0, n);
+  }
 }
 
 //PAGEBREAK!
@@ -445,6 +688,10 @@ stati(struct inode *ip, struct stat *st)
   st->type = ip->type;
   st->nlink = ip->nlink;
   st->size = ip->size;
+
+  st->child1 = ip->child1;
+	st->child2 = ip->child2;
+	st->checksum = ip->checksum;
 }
 
 //PAGEBREAK!
@@ -478,12 +725,25 @@ readi(struct inode *ip, char *dst, uint off, uint n)
 
 // PAGEBREAK!
 // Write data to inode.
-// Caller must hold ip->lock.
+//這個函式修改過了
 int
-writei(struct inode *ip, char *src, uint off, uint n)
+writei (struct inode *ip, char *src, uint off, uint n)
+{
+  return writei_ext(ip, src, off, n, 0);
+}
+
+
+// Extensible version of writei which, when the skip flag is set,
+//   overrides writing to the children of an inode.
+//這個函式是新增的
+int
+writei_ext(struct inode *ip, char *src, uint off, uint n, uint skip)
 {
   uint tot, m;
   struct buf *bp;
+  char *_src = src;
+  uint _off = off;
+
 
   if(ip->type == T_DEV){
     if(ip->major < 0 || ip->major >= NDEV || !devsw[ip->major].write)
@@ -503,11 +763,36 @@ writei(struct inode *ip, char *src, uint off, uint n)
     log_write(bp);
     brelse(bp);
   }
+  // Update ditto blocks
+  struct inode *ci;
 
-  if(n > 0 && off > ip->size){
-    ip->size = off;
-    iupdate(ip);
+  if (skip == 0) {
+    if (ip->child1) {
+      ci = iget(ip->dev, ip->child1);
+      ilock_ext(ci, 0);
+      writei(ci, _src, _off, n);
+      iunlock(ci);
+    }
+
+    if (ip->child2) {
+      ci = iget(ip->dev, ip->child2);
+      ilock_ext(ci, 0);
+      writei(ci, _src, _off, n);
+      iunlock(ci);
+    }
   }
+
+  // For ditto blocks, the parent iupdate call takes care of updating it
+  if (ip->type == T_DITTO)
+    return n;
+
+  // An alternative is to do ip->type != T_DEV
+  if (n > 0 && off > ip->size)
+    ip->size = off;
+
+  if (ip->type != T_DEV)
+    iupdate_ext(ip, skip);
+
   return n;
 }
 
@@ -623,7 +908,7 @@ skipelem(char *path, char *name)
 // path element into name, which must have room for DIRSIZ bytes.
 // Must be called inside a transaction since it calls iput().
 static struct inode*
-namex(char *path, int nameiparent, char *name)
+namex(char *path, int nameiparent, char *name, int trans)
 {
   struct inode *ip, *next;
 
@@ -633,7 +918,12 @@ namex(char *path, int nameiparent, char *name)
     ip = idup(myproc()->cwd);
 
   while((path = skipelem(path, name)) != 0){
-    ilock(ip);
+	  if (trans) {
+      if (ilock_trans(ip) != 0) return 0; // Failed to recover and lock
+    } else {
+      if (ilock(ip) != 0) return 0; // Failed to lock
+    }
+
     if(ip->type != T_DIR){
       iunlockput(ip);
       return 0;
@@ -658,14 +948,64 @@ namex(char *path, int nameiparent, char *name)
 }
 
 struct inode*
-namei(char *path)
+namei_ext(char *path, int trans)
 {
   char name[DIRSIZ];
-  return namex(path, 0, name);
+  return namex(path, 0, name, trans);
+}
+
+struct inode*
+nameiparent_ext(char *path, char *name, int trans)
+{
+  return namex(path, 1, name, trans);
+}
+
+struct inode*
+namei(char *path)
+{
+  return namei_ext(path, 0);
 }
 
 struct inode*
 nameiparent(char *path, char *name)
 {
-  return namex(path, 1, name);
+  return nameiparent_ext(path, name, 0);
+}
+
+struct inode*
+namei_trans(char *path)
+{
+  return namei_ext(path, 1);
+}
+
+struct inode*
+nameiparent_trans(char *path, char *name)
+{
+  return nameiparent_ext(path, name, 1);
+}
+
+int
+distance_to_root(char *path){
+    char name[DIRSIZ];
+    struct inode *dp, *ip;
+    uint inum1,inum2;
+    uint off;
+    dp = nameiparent_ext(path, name, 1);
+    ilock_trans(dp);
+    int counter = 1;
+    while((ip = dirlookup(dp,"..", &off) ) != 0){
+	inum1 = dp->inum;
+	iunlockput(dp);
+	dp = ip;
+	ilock_trans(dp);
+	inum2 = dp->inum;
+	//If this is the root.
+	if(inum1 == inum2){
+	    iunlockput(dp);
+	    break;
+	}
+	counter++;
+	off = 0;
+    }
+    return counter;
 }

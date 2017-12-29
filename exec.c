@@ -6,10 +6,12 @@
 #include "defs.h"
 #include "x86.h"
 #include "elf.h"
+#include "fs.h"
 
 int
 exec(char *path, char **argv)
 {
+
   char *s, *last;
   int i, off;
   uint argc, sz, sp, ustack[3+MAXARG+1];
@@ -21,12 +23,15 @@ exec(char *path, char **argv)
 
   begin_op();
 
-  if((ip = namei(path)) == 0){
+  if((ip = namei_trans(path)) == 0){
     end_op();
     cprintf("exec: fail\n");
     return -1;
   }
-  ilock(ip);
+
+  if (ilock_trans(ip))
+    return E_CORRUPTED;
+
   pgdir = 0;
 
   // Check ELF header
@@ -34,7 +39,6 @@ exec(char *path, char **argv)
     goto bad;
   if(elf.magic != ELF_MAGIC)
     goto bad;
-
   if((pgdir = setupkvm()) == 0)
     goto bad;
 
@@ -101,6 +105,7 @@ exec(char *path, char **argv)
   curproc->tf->esp = sp;
   switchuvm(curproc);
   freevm(oldpgdir);
+
   return 0;
 
  bad:
@@ -110,5 +115,6 @@ exec(char *path, char **argv)
     iunlockput(ip);
     end_op();
   }
+
   return -1;
 }

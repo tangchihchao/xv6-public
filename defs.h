@@ -41,17 +41,33 @@ struct inode*   dirlookup(struct inode*, char*, uint*);
 struct inode*   ialloc(uint, short);
 struct inode*   idup(struct inode*);
 void            iinit(int dev);
-void            ilock(struct inode*);
+int             ilock_ext(struct inode *, int);
+int             ilock(struct inode *);
+int             ilock_trans(struct inode *);
 void            iput(struct inode*);
 void            iunlock(struct inode*);
 void            iunlockput(struct inode*);
 void            iupdate(struct inode*);
+void            iupdate_ext(struct inode *, uint);
+void            irescue(struct inode *, struct inode *);
+void            iduplicate(struct inode *src, struct inode *dst, uint off, uint n);
+void            cupdate(struct inode *, struct inode *);
 int             namecmp(const char*, const char*);
 struct inode*   namei(char*);
 struct inode*   nameiparent(char*, char*);
+//新增namei_ext等4
+struct inode*	namei_ext(char*, int);
+struct inode*	nameiparent_ext(char*, char*, int);
+struct inode*	namei_trans(char*);
+struct inode*	nameiparent_trans(char*, char*);
 int             readi(struct inode*, char*, uint, uint);
 void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, char*, uint, uint);
+//新增writei_ext
+int				writei_ext(struct inode*, char*, uint, uint, uint);
+//新增distance_to_root
+int				distance_to_root(char * path);
+
 
 // ide.c
 void            ideinit(void);
@@ -85,6 +101,8 @@ void            microdelay(int);
 void            initlog(int dev);
 void            log_write(struct buf*);
 void            begin_op();
+void            commit();
+int     		is_log_busy();
 void            end_op();
 
 // mp.c
@@ -120,7 +138,7 @@ void            userinit(void);
 int             wait(void);
 void            wakeup(void*);
 void            yield(void);
-
+int             cps(void);
 // swtch.S
 void            swtch(struct context**, struct context*);
 

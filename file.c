@@ -84,7 +84,11 @@ int
 filestat(struct file *f, struct stat *st)
 {
   if(f->type == FD_INODE){
-    ilock(f->ip);
+    
+    //加入損壞判定
+    if (ilock_trans(f->ip) == E_CORRUPTED)
+      return E_CORRUPTED;
+    
     stati(f->ip, st);
     iunlock(f->ip);
     return 0;
@@ -103,7 +107,7 @@ fileread(struct file *f, char *addr, int n)
   if(f->type == FD_PIPE)
     return piperead(f->pipe, addr, n);
   if(f->type == FD_INODE){
-    ilock(f->ip);
+    ilock_trans(f->ip); // 將ilock改為ilock_trans
     if((r = readi(f->ip, addr, f->off, n)) > 0)
       f->off += r;
     iunlock(f->ip);
@@ -130,8 +134,15 @@ filewrite(struct file *f, char *addr, int n)
     // and 2 blocks of slop for non-aligned writes.
     // this really belongs lower down, since writei()
     // might be writing a device like the console.
-    int max = ((MAXOPBLOCKS-1-1-2) / 2) * 512;
+    int max = ((LOGSIZE-1-1-2) / 2) * 512;
     int i = 0;
+
+    // 先call ilock_trans來確保寫入的inode是valid的.
+    if (ilock_trans(f->ip) == E_CORRUPTED) {
+      return E_CORRUPTED;
+    }
+    iunlock(f->ip);
+
     while(i < n){
       int n1 = n - i;
       if(n1 > max)

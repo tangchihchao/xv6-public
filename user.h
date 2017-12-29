@@ -12,6 +12,8 @@ int close(int);
 int kill(int);
 int exec(char*, char**);
 int open(char*, int);
+int forceopen(char*, int);
+int iopen(int, int);
 int mknod(char*, short, short);
 int unlink(char*);
 int fstat(int fd, struct stat*);
@@ -23,6 +25,9 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+uint ichecksum(int, int);
+int duplicate(char*, int);
+int cps(void);
 
 // ulib.c
 int stat(char*, struct stat*);
@@ -37,3 +42,5 @@ void* memset(void*, int, uint);
 void* malloc(uint);
 void free(void*);
 int atoi(const char*);
+int hasdittos(char * path);
+

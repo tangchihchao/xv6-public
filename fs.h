@@ -21,7 +21,7 @@ struct superblock {
   uint bmapstart;    // Block number of first free map block
 };
 
-#define NDIRECT 12
+#define NDIRECT 10  // 由12改為10
 #define NINDIRECT (BSIZE / sizeof(uint))
 #define MAXFILE (NDIRECT + NINDIRECT)
 
@@ -33,6 +33,10 @@ struct dinode {
   short nlink;          // Number of links to inode in file system
   uint size;            // Size of file (bytes)
   uint addrs[NDIRECT+1];   // Data block addresses
+  
+  short child1;
+  short child2;
+  uint checksum;
 };
 
 // Inodes per block.
@@ -55,3 +59,16 @@ struct dirent {
   char name[DIRSIZ];
 };
 
+// Ditto Blocks
+#define DITTO_LOWER 3
+#define DITTO_HIGHER 6
+
+// Ditto Block Replica
+enum
+{
+  REPLICA_SELF,
+  REPLICA_CHILD_1,
+  REPLICA_CHILD_2
+} ditto_replica;
+
+#define E_CORRUPTED -10

@@ -1,7 +1,7 @@
 #include "types.h"
 #include "stat.h"
 #include "user.h"
-
+#include "fs.h"
 char buf[512];
 
 void
@@ -24,20 +24,40 @@ cat(int fd)
 int
 main(int argc, char *argv[])
 {
-  int fd, i;
+  int fd;
 
   if(argc <= 1){
     cat(0);
     exit();
   }
-
-  for(i = 1; i < argc; i++){
-    if((fd = open(argv[i], 0)) < 0){
-      printf(1, "cat: cannot open %s\n", argv[i]);
+  if (argc == 2)
+  {
+	  fd = open(argv[1], 0);
+	  if(fd==E_CORRUPTED){
+		  printf(1, "cat: %s is corrupted\n", argv[1]);
       exit();
     }
-    cat(fd);
-    close(fd);
+ else if (fd < 0) {
+	 printf(1, "cat: cannot open %s\n", argv[1]);
+	 exit();
+ }
+ cat(fd);
+ close(fd);
+ }
+ else if (argc == 3) {
+	 if (argv[1][0] == '-' && argv[1][1] == 'f') {
+		 fd = forceopen(argv[2], 0);
+		 if (fd < 0) {
+			 printf(1, "cat: cannot open %s\n", argv[2]);
+			 exit();
+		 }
+		 cat(fd);
+		 close(fd);	 
+	 }
+	 else {
+		 printf(1, "usage: cat [-f]? [PATH]\n");
+		 exit();	 
+	 }
   }
   exit();
 }

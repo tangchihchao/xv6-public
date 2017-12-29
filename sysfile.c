@@ -18,6 +18,7 @@
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
+struct inode* iget(uint dev, uint inum);
 static int
 argfd(int n, int *pfd, struct file **pf)
 {
@@ -27,7 +28,7 @@ argfd(int n, int *pfd, struct file **pf)
   if(argint(n, &fd) < 0)
     return -1;
   if(fd < 0 || fd >= NOFILE || (f=myproc()->ofile[fd]) == 0)
-    return -1;
+    return -2;
   if(pfd)
     *pfd = fd;
   if(pf)
@@ -120,17 +121,15 @@ sys_link(void)
 {
   char name[DIRSIZ], *new, *old;
   struct inode *dp, *ip;
-
+  int r;
   if(argstr(0, &old) < 0 || argstr(1, &new) < 0)
     return -1;
-
   begin_op();
-  if((ip = namei(old)) == 0){
+  if((ip = namei_trans(old)) == 0){
     end_op();
     return -1;
   }
-
-  ilock(ip);
+  ilock_trans(ip);
   if(ip->type == T_DIR){
     iunlockput(ip);
     end_op();
@@ -143,7 +142,11 @@ sys_link(void)
 
   if((dp = nameiparent(new, name)) == 0)
     goto bad;
-  ilock(dp);
+  
+  if ((r = ilock(dp)) != 0) {
+    cprintf("ilocked failed with val r = %d.\n", r);
+    panic("sys_link");
+  }
   if(dp->dev != ip->dev || dirlink(dp, name, ip->inum) < 0){
     iunlockput(dp);
     goto bad;
@@ -188,17 +191,20 @@ sys_unlink(void)
   struct dirent de;
   char name[DIRSIZ], *path;
   uint off;
+	int r;
 
   if(argstr(0, &path) < 0)
     return -1;
-
   begin_op();
-  if((dp = nameiparent(path, name)) == 0){
+  if((dp = nameiparent_trans(path, name)) == 0)
+  {		
     end_op();
-    return -1;
+	    return -1;
   }
-
-  ilock(dp);
+  if ((r = ilock(dp)) < 0) {
+     cprintf("ilocked failed with val r = %d.\n", r);
+    panic("sys_unlink");
+  }
 
   // Cannot unlink "." or "..".
   if(namecmp(name, ".") == 0 || namecmp(name, "..") == 0)
@@ -206,7 +212,12 @@ sys_unlink(void)
 
   if((ip = dirlookup(dp, name, &off)) == 0)
     goto bad;
-  ilock(ip);
+
+  if ((r = ilock_ext(ip, 0)) < 0) {
+    cprintf("ilock failed with val r = %d.\n", r);
+    panic("sys_unlink");
+  }
+  ilock_trans(ip);
 
   if(ip->nlink < 1)
     panic("unlink: nlink < 1");
@@ -244,9 +255,10 @@ create(char *path, short type, short major, short minor)
   uint off;
   struct inode *ip, *dp;
   char name[DIRSIZ];
-
-  if((dp = nameiparent(path, name)) == 0)
-    return 0;
+  //int dtr;
+  //dtr = distance_to_root(path);
+  if((dp = nameiparent_trans(path, name)) == 0)
+      return 0;
   ilock(dp);
 
   if((ip = dirlookup(dp, name, &off)) != 0){
@@ -265,6 +277,24 @@ create(char *path, short type, short major, short minor)
   ip->major = major;
   ip->minor = minor;
   ip->nlink = 1;
+/*
+  if(type == T_DIR && dtr < DITTO_HIGHER){//Create DITTO inodes
+    struct inode *child1, *child2;
+    if(dtr < DITTO_LOWER){//close to root, create 2 dittos
+
+ 	child1 = ialloc(dp->dev, T_DITTO);
+ 	child2 = ialloc(dp->dev, T_DITTO);
+ 	ip->child1 = child1->inum; 
+ 	ip->child2 = child2->inum;
+    }
+    else{
+ 	    if(dtr < DITTO_HIGHER){//Close enough to root, create 1 ditto
+ 	      child1 = ialloc(dp->dev, T_DITTO);
+ 	      ip->child1 = child1->inum; 
+ 	    }
+    }
+ }
+ */
   iupdate(ip);
 
   if(type == T_DIR){  // Create . and .. entries.
@@ -282,6 +312,84 @@ create(char *path, short type, short major, short minor)
 
   return ip;
 }
+// Helper function
+
+static void
+ipropagate(struct inode *ip)
+{
+    int max = ((LOGSIZE-1-1-2) / 2) * 512;
+    int i = 0;
+    uint off = 0;
+    int n = ip->size;
+    struct inode *ic;
+
+    while(i < n){
+      int n1 = n - i;
+      if(n1 > max)
+        n1 = max;
+
+      begin_op();
+
+      if (ip->child1) {
+        ic = iget(ip->dev, ip->child1);
+        ilock_ext(ic, 0);
+        iduplicate(ip, ic, off, n1);
+        iunlock(ic);
+      }
+
+      end_op();
+
+      begin_op();
+
+      if (ip->child2) {
+        ic = iget(ip->dev, ip->child2);
+        ilock_ext(ic, 0);
+        iduplicate(ip, ic, off, n1);
+        iunlock(ic);
+      }
+
+      end_op();
+      off += n1;
+      i += n1;
+    }
+
+}
+
+static struct inode*
+duplicate(char *path, int ndittos)
+{
+  struct inode *ip;
+  if((ip = namei_trans(path)) == 0)
+      return 0;
+
+  if (ilock_trans(ip) == E_CORRUPTED) {
+    return 0;
+  }
+
+  struct inode *child1, *child2;
+  begin_op();
+	if (ndittos > 0) {
+		if (ip->child1)
+			return 0;
+		child1 = ialloc(ip->dev, T_DITTO);
+		ip->child1 = child1->inum;
+	}
+
+	if (ndittos > 1) {
+		if (ip->child2)
+			return 0;
+		child2 = ialloc(ip->dev, T_DITTO);
+		ip->child2 = child2->inum;
+	}
+	end_op();
+	ipropagate(ip);
+
+	begin_op();
+	iupdate(ip);
+	iunlockput(ip);
+	end_op();
+  return ip;
+}
 
 int
 sys_open(void)
@@ -295,19 +403,22 @@ sys_open(void)
     return -1;
 
   begin_op();
-
   if(omode & O_CREATE){
-    ip = create(path, T_FILE, 0, 0);
-    if(ip == 0){
+    ip = create(path, T_FILE, 1, 0);
+    if(ip == 0)
+    {
       end_op();
       return -1;
     }
   } else {
-    if((ip = namei(path)) == 0){
+    if((ip = namei_trans(path)) == 0)
+    {
       end_op();
       return -1;
     }
-    ilock(ip);
+    if (ilock_trans(ip) == E_CORRUPTED)
+      return E_CORRUPTED;
+
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -334,16 +445,112 @@ sys_open(void)
 }
 
 int
+sys_forceopen(void)
+{
+  char *path;
+  int fd, omode;
+  struct file *f;
+  struct inode *ip;
+
+  if(argstr(0, &path) < 0 || argint(1, &omode) < 0)
+    return -1;
+
+  begin_op();
+  if(omode & O_CREATE){
+    ip = create(path, T_FILE, 1, 0);
+    if(ip == 0)
+    {
+      end_op();
+      return -1;
+    }
+  } else {
+    if((ip = namei_trans(path)) == 0)
+    {
+      end_op();
+      return -1;
+    }
+    
+    ilock_ext(ip, 0);
+
+    if(ip->type == T_DIR && omode != O_RDONLY){
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+  }
+
+  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+    if(f)
+      fileclose(f);
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlock(ip);
+  end_op();
+
+  f->type = FD_INODE;
+  f->ip = ip;
+  f->off = 0;
+  f->readable = !(omode & O_WRONLY);
+  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+  return fd;
+}
+
+
+int
+sys_iopen(void)
+{
+	int dev;
+	int inum;
+  int fd;
+  struct file *f;
+  struct inode *ip;
+	int omode = 0;
+  int r;
+
+  if(argint(0, &dev) < 0 || argint(1, &inum) < 0)
+    return -1;
+
+  if((ip = iget((uint)dev, inum)) == 0)
+    return -2;
+
+  if (( r = ilock_trans(ip)) == E_CORRUPTED) {
+    return E_CORRUPTED;
+  } else if ( r != 0) {
+    return -4;
+  }
+
+  if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+    if(f)
+      fileclose(f);
+    iunlockput(ip);
+    end_op();
+    return -3;
+  }
+  iunlock(ip);
+  end_op();
+
+  f->type = FD_INODE;
+  f->ip = ip;
+  f->off = 0;
+  f->readable = !(omode & O_WRONLY);
+  f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+  return fd;
+}
+
+int
 sys_mkdir(void)
 {
   char *path;
   struct inode *ip;
-
+  cprintf("begin");
   begin_op();
   if(argstr(0, &path) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
     end_op();
     return -1;
   }
+  cprintf("%d",ip->inum);
   iunlockput(ip);
   end_op();
   return 0;
@@ -377,11 +584,14 @@ sys_chdir(void)
   struct proc *curproc = myproc();
   
   begin_op();
-  if(argstr(0, &path) < 0 || (ip = namei(path)) == 0){
+  if(argstr(0, &path) < 0 || (ip = namei_trans(path)) == 0)
+  {
     end_op();
     return -1;
   }
-  ilock(ip);
+   if (ilock_trans(ip) == E_CORRUPTED)
+ 		return E_CORRUPTED;
+     
   if(ip->type != T_DIR){
     iunlockput(ip);
     end_op();
@@ -442,4 +652,57 @@ sys_pipe(void)
   fd[0] = fd0;
   fd[1] = fd1;
   return 0;
+}
+int
+sys_duplicate(void)
+{
+	char *path;
+	int ndittos;
+	struct inode *ip;
+
+	if (argstr(0, &path) < 0 || argint(1, &ndittos) < 0 ||
+		(ip = duplicate(path, ndittos)) == 0) {
+		return -1;
+	}
+	return 0;
+}
+uint ichecksum(struct inode *ip);
+uint
+sys_ichecksum(void)
+{
+	int dev;
+	int inum;
+	int fd;
+	uint cs;
+	struct file *f;
+	struct inode *ip;
+	int omode = 0;
+
+	if (argint(0, &dev) < 0 || argint(1, &inum) < 0)
+		return -1;
+
+	if ((ip = iget((uint)dev, inum)) == 0)
+		return -2;
+
+	if (ilock_trans(ip) == E_CORRUPTED)
+		return E_CORRUPTED;
+
+	if ((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0) {
+		if (f)
+			fileclose(f);
+		iunlockput(ip);
+		return -3;
+	}
+	cs = ichecksum(ip);
+	iunlock(ip);
+	f->type = FD_INODE;
+	f->ip = ip;
+	f->off = 0;
+	f->readable = !(omode & O_WRONLY);
+	f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+	// close file
+	myproc()->ofile[fd] = 0;
+	fileclose(f);
+
+	return cs;
 }

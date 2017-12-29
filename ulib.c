@@ -75,7 +75,7 @@ stat(char *n, struct stat *st)
 
   fd = open(n, O_RDONLY);
   if(fd < 0)
-    return -1;
+    return -fd;
   r = fstat(fd, st);
   close(fd);
   return r;
@@ -102,4 +102,19 @@ memmove(void *vdst, void *vsrc, int n)
   while(n-- > 0)
     *dst++ = *src++;
   return vdst;
+}
+
+int
+hasdittos(char * path){
+    int fd;
+    fd = forceopen(path, O_RDONLY);
+    struct stat st;
+    fstat(fd, &st);
+    close(fd);
+    if(st.child1){
+	return 1;
+    }
+    else{
+	return 0;
+    }
 }
